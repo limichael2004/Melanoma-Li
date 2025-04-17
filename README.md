@@ -9,7 +9,7 @@ The novelty of this framework is an dynamic weighted ensemble model (Resnet101, 
 
 The model was trained and nested cross-validated on the HAM10000 dataset, before undergoing a seperate external test set by Memorial Sloan Kettering.
 
-*Please note that there is a minor bug in the main code (combo.py), which is adressed in the testcombo.py and ensemble_folds_overlaid_graphs.py
+*Please note that there is a minor bug in the main code (combo.py), which is addressed in the testcombo.py and ensemble_folds_overlaid_graphs.py
 
 
 ## Results
