@@ -1,0 +1,1129 @@
+#!/usr/bin/env python
+import os
+import sys
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from torchvision import models, transforms
+from PIL import Image, ImageTk
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+import cv2
+import threading
+import time
+from pathlib import Path
+
+# Constants
+BASE_DIR = "/Users/michaelli/Desktop/combined_bayesian"
+MODELS_DIR = os.path.join(BASE_DIR, "saved_models")
+TEST_EVAL_DIR = os.path.join(MODELS_DIR, "test_evaluation")
+THEME_COLOR = "#2C3E50"  # Dark blue
+ACCENT_COLOR = "#3498DB"  # Light blue
+TEXT_COLOR = "#ECF0F1"   # Off-white
+WARNING_COLOR = "#E74C3C"  # Red
+SUCCESS_COLOR = "#2ECC71"  # Green
+GRAY_COLOR = "#95A5A6"    # Gray
+FONT_FAMILY = "Helvetica"
+
+# Make sure CUDA is available if possible
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class AttentionModule(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.attention(x)
+
+class DynamicWeight(nn.Module):
+    def __init__(self, num_models):
+        super().__init__()
+        self.weights = nn.Parameter(torch.ones(num_models) / num_models)
+
+    def forward(self, outputs):
+        stacked_outputs = torch.stack(outputs)
+        weights = torch.nn.functional.softmax(self.weights, dim=-1).view(-1, 1, 1)
+        return torch.sum(stacked_outputs * weights, dim=0)
+
+def create_model(model_name, num_classes=1, use_attention=True, dropout_rate=0.5,
+                hidden_size=256, pretrained=False, freeze_layers=0):
+    """Create model architecture based on the specified parameters"""
+    if model_name == 'resnet101':
+        model = models.resnet101(weights=None)
+        feature_dim = model.fc.in_features
+        in_channels_attention = 2048
+
+        if use_attention:
+            original_layer = model.layer4
+            attention_module = AttentionModule(in_channels_attention)
+            model.layer4 = nn.Sequential(original_layer, attention_module)
+
+        model.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.6),
+            nn.Linear(hidden_size, num_classes)
+        )
+
+    elif model_name == 'efficientnet_b4':
+        model = models.efficientnet_b4(weights=None)
+        feature_dim = model.classifier[1].in_features
+        in_channels_attention = 1792
+
+        if use_attention:
+            original_features = model.features
+            attention_module = AttentionModule(in_channels_attention)
+            model.features = nn.Sequential(original_features, attention_module)
+
+        model.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.6),
+            nn.Linear(hidden_size, num_classes)
+        )
+
+    elif model_name == 'densenet121':
+        model = models.densenet121(weights=None)
+        feature_dim = model.classifier.in_features
+        in_channels_attention = 1024
+
+        if use_attention:
+            original_features = model.features
+            attention_module = AttentionModule(in_channels_attention)
+            model.features = nn.Sequential(original_features, attention_module)
+
+        model.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.6),
+            nn.Linear(hidden_size, num_classes)
+        )
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
+
+    return model
+
+def load_model(model, checkpoint_path):
+    """Load model from checkpoint"""
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        return model
+    except Exception as e:
+        print(f"Error loading model from {checkpoint_path}: {e}")
+        return None
+
+def load_dynamic_weight(dynamic_weight, checkpoint_path):
+    """Load dynamic weight from checkpoint"""
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if 'dynamic_weight_state_dict' in checkpoint:
+            dynamic_weight.load_state_dict(checkpoint['dynamic_weight_state_dict'])
+        else:
+            dynamic_weight.load_state_dict(checkpoint)
+        return dynamic_weight
+    except Exception as e:
+        print(f"Error loading dynamic weight from {checkpoint_path}: {e}")
+        return None
+
+def load_fold_models(base_dir=BASE_DIR):
+    """Load models from all folds and their configurations"""
+    model_names = ['resnet101', 'efficientnet_b4', 'densenet121']
+    fold_models = {}
+    fold_dynamic_weights = {}
+    fold_hyperparams = {}
+    
+    for fold_num in range(5):  # Assuming 5 folds
+        fold_dir = os.path.join(base_dir, "saved_models", f"outer_fold_{fold_num}")
+        
+        # Load fold hyperparameters
+        try:
+            with open(os.path.join(fold_dir, "fold_config.json"), 'r') as f:
+                fold_config = json.load(f)
+            
+            hyperparams = fold_config.get('hyperparameters', {})
+            fold_hyperparams[fold_num] = hyperparams
+        except Exception:
+            hyperparams = {}
+            fold_hyperparams[fold_num] = {}
+        
+        # Create and load models
+        models_list = []
+        for model_name in model_names:
+            try:
+                model = create_model(
+                    model_name=model_name,
+                    use_attention=hyperparams.get('use_attention', True),
+                    dropout_rate=hyperparams.get('dropout_rate', 0.5),
+                    hidden_size=hyperparams.get('hidden_size', 256),
+                    pretrained=False
+                )
+                
+                model_path = os.path.join(fold_dir, f"{model_name}_best.pth")
+                loaded_model = load_model(model, model_path)
+                
+                if loaded_model is not None:
+                    loaded_model.to(device)
+                    loaded_model.eval()  # Set to evaluation mode
+                    models_list.append(loaded_model)
+            except Exception as e:
+                print(f"Error loading {model_name} for fold {fold_num}: {e}")
+        
+        if models_list:
+            fold_models[fold_num] = models_list
+            
+            # Load dynamic weight
+            try:
+                dynamic_weight = DynamicWeight(len(models_list))
+                dw_path = os.path.join(fold_dir, "dynamic_weight_best.pth")
+                loaded_dw = load_dynamic_weight(dynamic_weight, dw_path)
+                
+                if loaded_dw is not None:
+                    loaded_dw.to(device)
+                    fold_dynamic_weights[fold_num] = loaded_dw
+                else:
+                    dynamic_weight.to(device)
+                    fold_dynamic_weights[fold_num] = dynamic_weight
+            except Exception as e:
+                print(f"Error loading dynamic weight for fold {fold_num}: {e}")
+                dynamic_weight = DynamicWeight(len(models_list))
+                dynamic_weight.to(device)
+                fold_dynamic_weights[fold_num] = dynamic_weight
+    
+    return fold_models, fold_dynamic_weights, fold_hyperparams
+
+def load_thresholds(base_dir=BASE_DIR):
+    """Load optimal thresholds for each fold and ensemble"""
+    thresholds = {}
+    
+    # Load fold thresholds
+    for fold_num in range(5):
+        fold_dir = os.path.join(base_dir, "saved_models", f"outer_fold_{fold_num}")
+        try:
+            with open(os.path.join(fold_dir, "fold_config.json"), 'r') as f:
+                fold_config = json.load(f)
+            
+            threshold = fold_config.get('final_evaluation_threshold', 0.5)
+            thresholds[f'fold_{fold_num}'] = threshold
+        except Exception:
+            thresholds[f'fold_{fold_num}'] = 0.5  # Default threshold
+    
+    # Load ensemble threshold
+    try:
+        with open(os.path.join(base_dir, "saved_models", "test_evaluation", "test_results.json"), 'r') as f:
+            test_results = json.load(f)
+        
+        if 'dynamic_ensemble' in test_results:
+            thresholds['ensemble'] = test_results['dynamic_ensemble'].get('optimal_threshold', 0.5)
+        elif 'ensemble' in test_results:
+            thresholds['ensemble'] = test_results['ensemble'].get('optimal_threshold', 0.5)
+        else:
+            thresholds['ensemble'] = 0.5
+    except Exception:
+        thresholds['ensemble'] = 0.5
+    
+    return thresholds
+
+def predict_image(image_path, fold_models, fold_dynamic_weights, thresholds):
+    """Make predictions with each fold model and ensemble them"""
+    try:
+        # Define image transformation
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        
+        # Load and transform image
+        image = Image.open(image_path).convert('RGB')
+        image_tensor = transform(image).unsqueeze(0).to(device)
+        
+        # Make predictions with each fold
+        fold_probs = {}
+        fold_preds = {}
+        
+        for fold_num, models in fold_models.items():
+            dynamic_weight = fold_dynamic_weights[fold_num]
+            
+            with torch.no_grad():
+                outputs = []
+                for model in models:
+                    outputs.append(model(image_tensor))
+                
+                weighted_output = dynamic_weight(outputs)
+                prob = torch.sigmoid(weighted_output).squeeze().cpu().item()
+                
+                fold_probs[fold_num] = prob
+                fold_preds[fold_num] = prob >= thresholds.get(f'fold_{fold_num}', 0.5)
+        
+        # Calculate ensemble prediction (average of all fold probabilities)
+        if fold_probs:
+            ensemble_prob = np.mean(list(fold_probs.values()))
+            ensemble_pred = ensemble_prob >= thresholds.get('ensemble', 0.5)
+        else:
+            ensemble_prob = 0.0
+            ensemble_pred = False
+        
+        return {
+            'fold_probs': fold_probs,
+            'fold_preds': fold_preds,
+            'ensemble_prob': ensemble_prob,
+            'ensemble_pred': ensemble_pred
+        }
+    
+    except Exception as e:
+        print(f"Error predicting image: {e}")
+        return None
+
+def apply_grad_cam(image_path, model, target_layer_name='layer4'):
+    """Apply Grad-CAM visualization to show where the model is looking"""
+    try:
+        # Load image
+        img = Image.open(image_path).convert('RGB')
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        input_tensor = transform(img).unsqueeze(0).to(device)
+        
+        # Get target layer
+        if hasattr(model, 'layer4'):  # For ResNet
+            target_layer = model.layer4
+        elif hasattr(model, 'features'):  # For EfficientNet/DenseNet
+            target_layer = model.features
+        else:
+            return None
+        
+        # Get model output
+        model.eval()
+        model.zero_grad()
+        
+        # Forward pass
+        output = model(input_tensor)
+        
+        # Get gradients
+        output.backward()
+        
+        # Get activations and gradients
+        gradients = []
+        activations = []
+        
+        def hook_fn(module, input, output):
+            activations.append(output)
+            
+        def backward_hook_fn(module, grad_input, grad_output):
+            gradients.append(grad_output[0])
+        
+        handle = target_layer.register_forward_hook(hook_fn)
+        backward_handle = target_layer.register_backward_hook(backward_hook_fn)
+        
+        # Forward and backward pass
+        output = model(input_tensor)
+        output.backward()
+        
+        # Remove hooks
+        handle.remove()
+        backward_handle.remove()
+        
+        # Calculate weights
+        pooled_gradients = torch.mean(gradients[0], dim=[0, 2, 3])
+        
+        # Weight the channels by corresponding gradients
+        for i in range(activations[0].shape[1]):
+            activations[0][:, i, :, :] *= pooled_gradients[i]
+        
+        # Generate heatmap
+        heatmap = torch.mean(activations[0], dim=1).squeeze().cpu().detach().numpy()
+        heatmap = np.maximum(heatmap, 0)
+        heatmap /= np.max(heatmap) if np.max(heatmap) > 0 else 1
+        
+        # Resize heatmap to original image size
+        orig_img = cv2.imread(image_path)
+        heatmap = cv2.resize(heatmap, (orig_img.shape[1], orig_img.shape[0]))
+        heatmap = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+        
+        # Overlay heatmap on original image
+        superimposed_img = heatmap * 0.4 + orig_img
+        superimposed_img = np.clip(superimposed_img, 0, 255).astype(np.uint8)
+        
+        return superimposed_img
+    
+    except Exception as e:
+        print(f"Error applying Grad-CAM: {e}")
+        return None
+
+class MelanomaApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Melanoma-Li: AI Powered Skin Cancer Detection")
+        self.root.geometry("1280x800")
+        self.root.configure(bg=THEME_COLOR)
+        
+        # Load application icon if available
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+            if os.path.exists(icon_path):
+                icon = ImageTk.PhotoImage(file=icon_path)
+                self.root.iconphoto(True, icon)
+        except Exception:
+            pass
+        
+        # Initialize variables
+        self.image_path = None
+        self.results = None
+        self.grad_cam_img = None
+        self.fold_models = None
+        self.fold_dynamic_weights = None
+        self.thresholds = None
+        self.loading = False
+        
+        # Create main layout frames
+        self.create_frames()
+        self.create_header()
+        self.create_image_section()
+        self.create_results_section()
+        self.create_about_section()
+        
+        # Start a thread to load models
+        self.load_models_thread = threading.Thread(target=self.load_models)
+        self.load_models_thread.daemon = True
+        self.load_models_thread.start()
+    
+    def create_frames(self):
+        # Create header frame
+        self.header_frame = tk.Frame(self.root, bg=THEME_COLOR, height=100)
+        self.header_frame.pack(fill=tk.X, padx=20, pady=(20, 0))
+        
+        # Create content frame
+        self.content_frame = tk.Frame(self.root, bg=THEME_COLOR)
+        self.content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Create left panel (image upload and visualizations)
+        self.left_panel = tk.Frame(self.content_frame, bg=THEME_COLOR)
+        self.left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        
+        # Create right panel (results and metrics)
+        self.right_panel = tk.Frame(self.content_frame, bg=THEME_COLOR)
+        self.right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+    
+    def create_header(self):
+        # Add application logo/title
+        self.title_label = tk.Label(
+            self.header_frame, 
+            text="Melanoma-Li",
+            font=(FONT_FAMILY, 32, "bold"),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR
+        )
+        self.title_label.pack(side=tk.LEFT)
+        
+        # Add subtitle
+        self.subtitle_label = tk.Label(
+            self.header_frame, 
+            text="AI Powered Skin Cancer Detection",
+            font=(FONT_FAMILY, 16),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR
+        )
+        self.subtitle_label.pack(side=tk.LEFT, padx=(10, 0), pady=(15, 0))
+        
+        # Add about button
+        self.about_button = tk.Button(
+            self.header_frame,
+            text="About",
+            font=(FONT_FAMILY, 12),
+            bg=ACCENT_COLOR,
+            fg=TEXT_COLOR,
+            command=self.show_about,
+            relief=tk.FLAT,
+            padx=15
+        )
+        self.about_button.pack(side=tk.RIGHT, pady=(10, 0))
+    
+    def create_image_section(self):
+        # Create frame for image section
+        self.image_frame = tk.LabelFrame(
+            self.left_panel,
+            text="Lesion Image",
+            font=(FONT_FAMILY, 14),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR,
+            bd=2
+        )
+        self.image_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # Create canvas for displaying the image
+        self.image_canvas = tk.Canvas(
+            self.image_frame,
+            bg=THEME_COLOR,
+            bd=0,
+            highlightthickness=0
+        )
+        self.image_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Add placeholder text
+        self.placeholder_text = self.image_canvas.create_text(
+            200, 200,
+            text="No image selected",
+            fill=TEXT_COLOR,
+            font=(FONT_FAMILY, 14)
+        )
+        
+        # Create buttons frame
+        self.buttons_frame = tk.Frame(self.left_panel, bg=THEME_COLOR)
+        self.buttons_frame.pack(fill=tk.X, pady=10)
+        
+        # Add upload button
+        self.upload_button = tk.Button(
+            self.buttons_frame,
+            text="Upload Image",
+            font=(FONT_FAMILY, 12),
+            bg=ACCENT_COLOR,
+            fg=TEXT_COLOR,
+            command=self.upload_image,
+            relief=tk.FLAT,
+            padx=15
+        )
+        self.upload_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Add analyze button
+        self.analyze_button = tk.Button(
+            self.buttons_frame,
+            text="Analyze Image",
+            font=(FONT_FAMILY, 12),
+            bg=ACCENT_COLOR,
+            fg=TEXT_COLOR,
+            command=self.analyze_image,
+            relief=tk.FLAT,
+            padx=15,
+            state=tk.DISABLED
+        )
+        self.analyze_button.pack(side=tk.LEFT)
+        
+        # Add Grad-CAM visualization frame
+        self.gradcam_frame = tk.LabelFrame(
+            self.left_panel,
+            text="Model Attention Visualization (Grad-CAM)",
+            font=(FONT_FAMILY, 14),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR,
+            bd=2
+        )
+        self.gradcam_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        
+        # Create canvas for Grad-CAM visualization
+        self.gradcam_canvas = tk.Canvas(
+            self.gradcam_frame,
+            bg=THEME_COLOR,
+            bd=0,
+            highlightthickness=0
+        )
+        self.gradcam_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Add placeholder text
+        self.gradcam_placeholder_text = self.gradcam_canvas.create_text(
+            200, 200,
+            text="No analysis performed",
+            fill=TEXT_COLOR,
+            font=(FONT_FAMILY, 14)
+        )
+    
+    def create_results_section(self):
+        # Create main results frame
+        self.results_frame = tk.LabelFrame(
+            self.right_panel,
+            text="Analysis Results",
+            font=(FONT_FAMILY, 14),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR,
+            bd=2
+        )
+        self.results_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create ensemble results frame
+        self.ensemble_frame = tk.Frame(self.results_frame, bg=THEME_COLOR)
+        self.ensemble_frame.pack(fill=tk.X, padx=20, pady=20)
+        
+        # Ensemble result label
+        self.ensemble_label = tk.Label(
+            self.ensemble_frame,
+            text="Ensemble Prediction",
+            font=(FONT_FAMILY, 18, "bold"),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR
+        )
+        self.ensemble_label.pack(anchor=tk.W)
+        
+        # Ensemble probability label
+        self.ensemble_prob_label = tk.Label(
+            self.ensemble_frame,
+            text="Probability: N/A",
+            font=(FONT_FAMILY, 14),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR
+        )
+        self.ensemble_prob_label.pack(anchor=tk.W, pady=(5, 0))
+        
+        # Ensemble prediction label
+        self.ensemble_pred_label = tk.Label(
+            self.ensemble_frame,
+            text="Prediction: N/A",
+            font=(FONT_FAMILY, 16, "bold"),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR
+        )
+        self.ensemble_pred_label.pack(anchor=tk.W, pady=(5, 0))
+        
+        # Separator
+        ttk.Separator(self.results_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=20, pady=10)
+        
+        # Create individual folds frame
+        self.folds_frame = tk.Frame(self.results_frame, bg=THEME_COLOR)
+        self.folds_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        # Individual folds label
+        self.folds_label = tk.Label(
+            self.folds_frame,
+            text="Individual Model Predictions",
+            font=(FONT_FAMILY, 16, "bold"),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR
+        )
+        self.folds_label.pack(anchor=tk.W, pady=(0, 10))
+        
+        # Create frame for fold results
+        self.fold_results_frame = tk.Frame(self.folds_frame, bg=THEME_COLOR)
+        self.fold_results_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create fold result labels
+        self.fold_labels = {}
+        for i in range(5):
+            fold_frame = tk.Frame(self.fold_results_frame, bg=THEME_COLOR)
+            fold_frame.pack(fill=tk.X, pady=(0, 10))
+            
+            fold_title = tk.Label(
+                fold_frame,
+                text=f"Fold {i}",
+                font=(FONT_FAMILY, 14, "bold"),
+                bg=THEME_COLOR,
+                fg=TEXT_COLOR
+            )
+            fold_title.pack(anchor=tk.W)
+            
+            fold_prob = tk.Label(
+                fold_frame,
+                text="Probability: N/A",
+                font=(FONT_FAMILY, 12),
+                bg=THEME_COLOR,
+                fg=TEXT_COLOR
+            )
+            fold_prob.pack(anchor=tk.W)
+            
+            fold_pred = tk.Label(
+                fold_frame,
+                text="Prediction: N/A",
+                font=(FONT_FAMILY, 12),
+                bg=THEME_COLOR,
+                fg=TEXT_COLOR
+            )
+            fold_pred.pack(anchor=tk.W)
+            
+            self.fold_labels[i] = {
+                'title': fold_title,
+                'prob': fold_prob,
+                'pred': fold_pred
+            }
+        
+        # Create a probability visualization frame
+        self.prob_viz_frame = tk.LabelFrame(
+            self.right_panel,
+            text="Probability Visualization",
+            font=(FONT_FAMILY, 14),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR,
+            bd=2
+        )
+        self.prob_viz_frame.pack(fill=tk.BOTH, expand=True, pady=(20, 0))
+        
+        # Create the probability visualization using matplotlib
+        self.fig = Figure(figsize=(5, 3), dpi=100)
+        self.fig.patch.set_facecolor(THEME_COLOR)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor(THEME_COLOR)
+        
+        # Create canvas for the plot
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.prob_viz_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Style the plot
+        self.ax.set_title("Prediction Probabilities", color=TEXT_COLOR)
+        self.ax.set_xlabel("Model", color=TEXT_COLOR)
+        self.ax.set_ylabel("Probability", color=TEXT_COLOR)
+        self.ax.tick_params(axis='x', colors=TEXT_COLOR)
+        self.ax.tick_params(axis='y', colors=TEXT_COLOR)
+        for spine in self.ax.spines.values():
+            spine.set_edgecolor(TEXT_COLOR)
+        self.ax.set_ylim(0, 1)
+        self.ax.grid(alpha=0.3)
+        
+        # Set placeholder text
+        self.ax.text(0.5, 0.5, "No analysis performed", 
+                    ha='center', va='center', color=TEXT_COLOR, 
+                    transform=self.ax.transAxes, fontsize=12)
+        self.canvas.draw()
+    
+    def create_about_section(self):
+        # Create about window (hidden initially)
+        self.about_window = tk.Toplevel(self.root)
+        self.about_window.title("About Melanoma-Li")
+        self.about_window.geometry("600x500")
+        self.about_window.configure(bg=THEME_COLOR)
+        self.about_window.withdraw()  # Hide initially
+        
+        # About title
+        self.about_title_label = tk.Label(
+            self.about_window,
+            text="Melanoma-Li",
+            font=(FONT_FAMILY, 24, "bold"),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR
+        )
+        self.about_title_label.pack(pady=(20, 0))
+        
+        # About subtitle
+        self.about_subtitle_label = tk.Label(
+            self.about_window,
+            text="AI Powered Skin Cancer Detection",
+            font=(FONT_FAMILY, 16),
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR
+        )
+        self.about_subtitle_label.pack(pady=(5, 20))
+        
+        # About content
+        about_text = """Melanoma-Li is an advanced AI-powered system for detecting melanoma in skin lesion images. It uses state-of-the-art deep learning models including ResNet101, EfficientNet-B4, and DenseNet121 with attention mechanisms to identify potential skin cancer.
+
+The system incorporates an ensemble of 5 models, each trained on different data splits, to provide robust predictions. The dynamic weighted ensemble combines the predictions from all models for optimal performance.
+
+This tool is designed to assist medical professionals in the early detection of melanoma and should not replace professional medical advice. Always consult with a dermatologist for proper diagnosis.
+
+Created by: Michael Li
+"""
+        
+        # About content label
+        self.about_content = tk.Text(
+            self.about_window,
+            wrap=tk.WORD,
+            height=15,
+            width=60,
+            bg=THEME_COLOR,
+            fg=TEXT_COLOR,
+            font=(FONT_FAMILY, 12),
+            relief=tk.FLAT,
+            padx=20,
+            pady=20
+        )
+        self.about_content.insert(tk.END, about_text)
+        self.about_content.config(state=tk.DISABLED)
+        self.about_content.pack(fill=tk.BOTH, expand=True, padx=20, pady=0)
+        
+        # Close button
+        self.about_close_button = tk.Button(
+            self.about_window,
+            text="Close",
+            font=(FONT_FAMILY, 12),
+            bg=ACCENT_COLOR,
+            fg=TEXT_COLOR,
+            command=self.hide_about,
+            relief=tk.FLAT,
+            padx=20
+        )
+        self.about_close_button.pack(pady=20)
+    
+    def show_about(self):
+        """Show the about window"""
+        # Center the window
+        self.center_window(self.about_window)
+        self.about_window.deiconify()
+        self.about_window.lift()
+        self.about_window.focus_set()
+    
+    def hide_about(self):
+        """Hide the about window"""
+        self.about_window.withdraw()
+    
+    def center_window(self, window):
+        """Center a window on the screen"""
+        window.update_idletasks()
+        width = window.winfo_width()
+        height = window.winfo_height()
+        x = (window.winfo_screenwidth() // 2) - (width // 2)
+        y = (window.winfo_screenheight() // 2) - (height // 2)
+        window.geometry('{}x{}+{}+{}'.format(width, height, x, y))
+    
+    def load_models(self):
+        """Load all models in a background thread"""
+        try:
+            # Update UI to show loading
+            self.root.after(0, self.show_loading, True)
+            
+            # Load models and configurations
+            self.fold_models, self.fold_dynamic_weights, _ = load_fold_models()
+            self.thresholds = load_thresholds()
+            
+            # Update UI to show ready
+            self.root.after(0, self.show_loading, False)
+            
+        except Exception as e:
+            print(f"Error loading models: {e}")
+            self.root.after(0, self.show_loading_error)
+    
+    def show_loading(self, is_loading):
+        """Show or hide loading indicator"""
+        self.loading = is_loading
+        if is_loading:
+            self.upload_button.config(state=tk.DISABLED)
+            self.analyze_button.config(state=tk.DISABLED)
+            self.image_canvas.itemconfig(
+                self.placeholder_text,
+                text="Loading models...\nThis may take a few moments."
+            )
+        else:
+            self.upload_button.config(state=tk.NORMAL)
+            if self.image_path:
+                self.analyze_button.config(state=tk.NORMAL)
+            self.image_canvas.itemconfig(
+                self.placeholder_text,
+                text="No image selected" if not self.image_path else ""
+            )
+    
+    def show_loading_error(self):
+        """Show loading error message"""
+        self.loading = False
+        self.upload_button.config(state=tk.NORMAL)
+        messagebox.showerror("Error", "Failed to load models. Please check if the model files exist in the correct location.")
+    
+    def upload_image(self):
+        """Handle image upload"""
+        if self.loading:
+            return
+        
+        file_path = filedialog.askopenfilename(
+            title="Select Image",
+            filetypes=[
+                ("Image files", "*.jpg *.jpeg *.png *.bmp"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if file_path:
+            try:
+                self.image_path = file_path
+                
+                # Load and display image
+                image = Image.open(file_path)
+                image = self.resize_image_to_fit(image, self.image_canvas)
+                self.display_image = ImageTk.PhotoImage(image)
+                
+                # Clear canvas and display image
+                self.image_canvas.delete("all")
+                self.image_canvas.create_image(
+                    self.image_canvas.winfo_width() // 2,
+                    self.image_canvas.winfo_height() // 2,
+                    image=self.display_image,
+                    anchor=tk.CENTER
+                )
+                
+                # Enable analyze button if models are loaded
+                if not self.loading and self.fold_models:
+                    self.analyze_button.config(state=tk.NORMAL)
+                
+                # Reset results
+                self.results = None
+                self.reset_results_display()
+                
+                # Clear Grad-CAM visualization
+                self.gradcam_canvas.delete("all")
+                self.gradcam_canvas.create_text(
+                    self.gradcam_canvas.winfo_width() // 2,
+                    self.gradcam_canvas.winfo_height() // 2,
+                    text="No analysis performed",
+                    fill=TEXT_COLOR,
+                    font=(FONT_FAMILY, 14)
+                )
+                
+            except Exception as e:
+                print(f"Error loading image: {e}")
+                messagebox.showerror("Error", f"Failed to load image: {str(e)}")
+    
+    def resize_image_to_fit(self, image, canvas, max_ratio=0.9):
+        """Resize image to fit in the canvas"""
+        canvas_width = canvas.winfo_width()
+        canvas_height = canvas.winfo_height()
+        
+        # If canvas size is not yet determined, use default values
+        if canvas_width <= 1 or canvas_height <= 1:
+            canvas_width = 400
+            canvas_height = 300
+        
+        # Calculate target size to fit in canvas
+        target_width = int(canvas_width * max_ratio)
+        target_height = int(canvas_height * max_ratio)
+        
+        # Calculate image's aspect ratio
+        img_width, img_height = image.size
+        img_ratio = img_width / img_height
+        
+        # Determine resize dimensions while preserving aspect ratio
+        if img_width > target_width or img_height > target_height:
+            if img_ratio > (target_width / target_height):
+                # Image is wider, constrain by width
+                new_width = target_width
+                new_height = int(new_width / img_ratio)
+            else:
+                # Image is taller, constrain by height
+                new_height = target_height
+                new_width = int(new_height * img_ratio)
+            
+            return image.resize((new_width, new_height), Image.LANCZOS)
+        
+        return image
+    
+    def analyze_image(self):
+        """Analyze the current image with all models"""
+        if not self.image_path or not self.fold_models or self.loading:
+            return
+        
+        # Show loading indicator
+        self.analyze_button.config(state=tk.DISABLED)
+        self.upload_button.config(state=tk.DISABLED)
+        self.root.config(cursor="wait")
+        
+        # Run analysis in a thread to avoid freezing UI
+        threading.Thread(target=self.run_analysis).start()
+    
+    def run_analysis(self):
+        """Run the analysis in a background thread"""
+        try:
+            # Make predictions
+            self.results = predict_image(
+                self.image_path,
+                self.fold_models,
+                self.fold_dynamic_weights,
+                self.thresholds
+            )
+            
+            # Apply Grad-CAM to visualize model attention
+            # Use the first model from the first fold for visualization
+            if self.fold_models and 0 in self.fold_models and self.fold_models[0]:
+                first_model = self.fold_models[0][0]  # First model (ResNet) from fold 0
+                self.grad_cam_img = apply_grad_cam(self.image_path, first_model)
+            
+            # Update UI with results
+            self.root.after(0, self.update_results_display)
+            
+        except Exception as e:
+            print(f"Error during analysis: {e}")
+            error_msg = str(e)
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Analysis failed: {error_msg}"))           
+            self.root.after(0, self.reset_after_analysis)
+                
+    def update_results_display(self):
+        """Update UI with analysis results"""
+        if not self.results:
+            self.reset_results_display()
+            self.reset_after_analysis()
+            return
+        
+        # Update ensemble results
+        ensemble_prob = self.results['ensemble_prob']
+        ensemble_pred = self.results['ensemble_pred']
+        
+        self.ensemble_prob_label.config(
+            text=f"Probability: {ensemble_prob:.2%}"
+        )
+        
+        prediction_text = "Melanoma" if ensemble_pred else "Benign"
+        prediction_color = WARNING_COLOR if ensemble_pred else SUCCESS_COLOR
+        
+        self.ensemble_pred_label.config(
+            text=f"Prediction: {prediction_text}",
+            fg=prediction_color
+        )
+        
+        # Update fold results
+        fold_probs = self.results['fold_probs']
+        fold_preds = self.results['fold_preds']
+        
+        for fold_num, labels in self.fold_labels.items():
+            if fold_num in fold_probs:
+                prob = fold_probs[fold_num]
+                pred = fold_preds[fold_num]
+                
+                labels['prob'].config(
+                    text=f"Probability: {prob:.2%}"
+                )
+                
+                fold_pred_text = "Melanoma" if pred else "Benign"
+                fold_pred_color = WARNING_COLOR if pred else SUCCESS_COLOR
+                
+                labels['pred'].config(
+                    text=f"Prediction: {fold_pred_text}",
+                    fg=fold_pred_color
+                )
+            else:
+                labels['prob'].config(text="Probability: N/A")
+                labels['pred'].config(text="Prediction: N/A", fg=TEXT_COLOR)
+        
+        # Update probability visualization
+        self.update_probability_plot()
+        
+        # Update Grad-CAM visualization
+        if self.grad_cam_img is not None:
+            # Convert OpenCV image to PIL format
+            grad_cam_pil = Image.fromarray(cv2.cvtColor(self.grad_cam_img, cv2.COLOR_BGR2RGB))
+            
+            # Resize to fit canvas
+            grad_cam_pil = self.resize_image_to_fit(grad_cam_pil, self.gradcam_canvas)
+            
+            # Convert to PhotoImage for display
+            self.grad_cam_display = ImageTk.PhotoImage(grad_cam_pil)
+            
+            # Clear canvas and display image
+            self.gradcam_canvas.delete("all")
+            self.gradcam_canvas.create_image(
+                self.gradcam_canvas.winfo_width() // 2,
+                self.gradcam_canvas.winfo_height() // 2,
+                image=self.grad_cam_display,
+                anchor=tk.CENTER
+            )
+        
+        self.reset_after_analysis()
+    
+    def update_probability_plot(self):
+        """Update probability visualization plot"""
+        if not self.results:
+            return
+        
+        # Clear the plot
+        self.ax.clear()
+        
+        # Set up the plot
+        fold_nums = sorted(self.results['fold_probs'].keys())
+        fold_probs = [self.results['fold_probs'][i] for i in fold_nums]
+        ensemble_prob = self.results['ensemble_prob']
+        
+        # Create labels for x-axis
+        labels = [f"Fold {i}" for i in fold_nums] + ["Ensemble"]
+        
+        # Create bar colors based on predictions
+        fold_preds = [self.results['fold_preds'][i] for i in fold_nums]
+        ensemble_pred = self.results['ensemble_pred']
+        
+        colors = []
+        for pred in fold_preds:
+            colors.append(WARNING_COLOR if pred else SUCCESS_COLOR)
+        colors.append(WARNING_COLOR if ensemble_pred else SUCCESS_COLOR)
+        
+        # Create bars
+        bars = self.ax.bar(
+            labels,
+            fold_probs + [ensemble_prob],
+            color=colors,
+            alpha=0.7
+        )
+        
+        # Add a threshold line for ensemble
+        if 'ensemble' in self.thresholds:
+            threshold = self.thresholds['ensemble']
+            self.ax.axhline(y=threshold, color='black', linestyle='--', 
+                           label=f'Threshold: {threshold:.2f}')
+        
+        # Customize plot
+        self.ax.set_title("Prediction Probabilities", color=TEXT_COLOR)
+        self.ax.set_xlabel("Model", color=TEXT_COLOR)
+        self.ax.set_ylabel("Probability", color=TEXT_COLOR)
+        self.ax.tick_params(axis='x', colors=TEXT_COLOR, rotation=45)
+        self.ax.tick_params(axis='y', colors=TEXT_COLOR)
+        for spine in self.ax.spines.values():
+            spine.set_edgecolor(TEXT_COLOR)
+        self.ax.set_ylim(0, 1)
+        self.ax.grid(alpha=0.3)
+        
+        # Add value labels
+        for bar in bars:
+            height = bar.get_height()
+            self.ax.text(
+                bar.get_x() + bar.get_width()/2.,
+                height + 0.02,
+                f'{height:.2f}',
+                ha='center', va='bottom',
+                color=TEXT_COLOR
+            )
+        
+        # Add legend
+        self.ax.legend()
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+    
+    def reset_results_display(self):
+        """Reset results display to default state"""
+        self.ensemble_prob_label.config(text="Probability: N/A")
+        self.ensemble_pred_label.config(text="Prediction: N/A", fg=TEXT_COLOR)
+        
+        for fold_num, labels in self.fold_labels.items():
+            labels['prob'].config(text="Probability: N/A")
+            labels['pred'].config(text="Prediction: N/A", fg=TEXT_COLOR)
+        
+        # Clear the plot
+        self.ax.clear()
+        self.ax.set_title("Prediction Probabilities", color=TEXT_COLOR)
+        self.ax.set_xlabel("Model", color=TEXT_COLOR)
+        self.ax.set_ylabel("Probability", color=TEXT_COLOR)
+        self.ax.tick_params(axis='x', colors=TEXT_COLOR)
+        self.ax.tick_params(axis='y', colors=TEXT_COLOR)
+        for spine in self.ax.spines.values():
+            spine.set_edgecolor(TEXT_COLOR)
+        self.ax.set_ylim(0, 1)
+        self.ax.grid(alpha=0.3)
+        
+        # Set placeholder text
+        self.ax.text(0.5, 0.5, "No analysis performed", 
+                    ha='center', va='center', color=TEXT_COLOR, 
+                    transform=self.ax.transAxes, fontsize=12)
+        self.canvas.draw()
+    
+    def reset_after_analysis(self):
+        """Reset UI state after analysis is complete"""
+        self.upload_button.config(state=tk.NORMAL)
+        self.analyze_button.config(state=tk.NORMAL)
+        self.root.config(cursor="")
+
+def main():
+    root = tk.Tk()
+    app = MelanomaApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
