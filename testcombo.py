@@ -1,0 +1,1064 @@
+#!/usr/bin/env python
+import os
+import sys
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from torchvision import models, transforms
+from sklearn.metrics import (roc_curve, auc, precision_recall_curve, 
+                            f1_score, accuracy_score, recall_score, precision_score,
+                            matthews_corrcoef, confusion_matrix, log_loss)
+import logging
+import glob
+from pathlib import Path
+import warnings
+import torch.nn.functional as F
+warnings.filterwarnings('ignore')
+
+# Set up logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[logging.StreamHandler(sys.stdout)])
+
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logging.info(f"Using device: {device}")
+
+# Dynamic weight module for ensemble
+class DynamicWeight(nn.Module):
+    def __init__(self, num_models):
+        super().__init__()
+        self.weights = nn.Parameter(torch.ones(num_models) / num_models)  # Initialize weights equally
+
+    def forward(self, outputs):
+        # Stack model outputs [num_models, batch_size, 1]
+        stacked_outputs = torch.stack(outputs)
+        # Get softmax weights and reshape for broadcasting [num_models, 1, 1]
+        weights = self.weights.softmax(-1).view(-1, 1, 1)
+        # Apply weights and sum along model dimension
+        return torch.sum(stacked_outputs * weights, dim=0)
+
+# Attention module definition (needed for model creation)
+class AttentionModule(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super().__init__()
+        # Define a small network to learn attention weights
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1),  # Reduce the channel size
+            nn.ReLU(),  # Apply ReLU activation
+            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1),  # Restore the original channel size
+            nn.Sigmoid()  # Output a value between 0 and 1 to apply as attention weights
+        )
+
+    def forward(self, x):
+        # Multiply input tensor by the attention map
+        return x * self.attention(x)
+
+# Function to create model with attention and customizable architecture
+def create_model(model_name, num_classes=1, use_attention=True, dropout_rate=0.5,
+                hidden_size=256, pretrained=False, freeze_layers=0):
+    """
+    Create model with customizable architecture - simplified version for inference only
+    """
+    if model_name == 'resnet101':
+        model = models.resnet101(weights=None)
+        feature_dim = model.fc.in_features
+        in_channels_attention = 2048
+
+        if use_attention:
+            # Get the original layer
+            original_layer = model.layer4
+            # Create attention module with correct input channels
+            attention_module = AttentionModule(in_channels_attention)
+            # Replace the layer with a sequence containing the original layer and attention
+            model.layer4 = nn.Sequential(original_layer, attention_module)
+
+        # Replace the final fully connected layer
+        model.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.6),  # Second dropout layer with lower rate
+            nn.Linear(hidden_size, num_classes)
+        )
+
+    elif model_name == 'efficientnet_b4':
+        model = models.efficientnet_b4(weights=None)
+        feature_dim = model.classifier[1].in_features
+        in_channels_attention = 1792
+
+        if use_attention:
+            # Get the original features sequence
+            original_features = model.features
+            # Create attention module
+            attention_module = AttentionModule(in_channels_attention)
+            # Append attention module after the features
+            model.features = nn.Sequential(original_features, attention_module)
+
+        # Replace the classifier
+        model.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.6),
+            nn.Linear(hidden_size, num_classes)
+        )
+
+    elif model_name == 'densenet121':
+        model = models.densenet121(weights=None)
+        feature_dim = model.classifier.in_features
+        in_channels_attention = 1024
+
+        if use_attention:
+            # Get the original features sequence
+            original_features = model.features
+            # Create attention module
+            attention_module = AttentionModule(in_channels_attention)
+            # Insert attention after the features
+            model.features = nn.Sequential(original_features, attention_module)
+
+        # Replace the classifier
+        model.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.6),
+            nn.Linear(hidden_size, num_classes)
+        )
+
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
+
+    return model
+
+def load_model(model, checkpoint_path):
+    """
+    Load model from checkpoint
+    """
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # Handle both direct state dict and checkpoint dictionary
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        logging.info(f"Loaded model from {checkpoint_path}")
+        return model
+    except Exception as e:
+        logging.error(f"Error loading model from {checkpoint_path}: {e}")
+        return None
+
+def load_dynamic_weight(dynamic_weight, checkpoint_path):
+    """
+    Load dynamic weight from checkpoint
+    """
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # Handle both direct state dict and checkpoint dictionary
+        if 'dynamic_weight_state_dict' in checkpoint:
+            dynamic_weight.load_state_dict(checkpoint['dynamic_weight_state_dict'])
+        else:
+            dynamic_weight.load_state_dict(checkpoint)
+        logging.info(f"Loaded dynamic weight from {checkpoint_path}")
+        return dynamic_weight
+    except Exception as e:
+        logging.error(f"Error loading dynamic weight from {checkpoint_path}: {e}")
+        return None
+
+def ensemble_predict(models, inputs, dynamic_weight):
+    """
+    Ensemble prediction function that handles device placement
+    """
+    outputs = []
+
+    for model in models:
+        model.eval()
+        with torch.no_grad():
+            outputs.append(model(inputs))
+
+    # Apply dynamic weighting
+    weighted_outputs = dynamic_weight(outputs)
+    return weighted_outputs
+
+def setup_directories(base_dir):
+    """Set up necessary directories for outputs"""
+    # Create base directory if it doesn't exist
+    os.makedirs(base_dir, exist_ok=True)
+    
+    # Create subdirectories
+    save_dir = os.path.join(base_dir, "saved_models")
+    test_results_dir = os.path.join(save_dir, "test_evaluation")
+    dyn_ensemble_dir = os.path.join(test_results_dir, "dynamic_ensemble_plots")
+    overlay_dir = os.path.join(test_results_dir, "overlay_plots")
+    
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(test_results_dir, exist_ok=True)
+    os.makedirs(dyn_ensemble_dir, exist_ok=True)
+    os.makedirs(overlay_dir, exist_ok=True)
+    
+    return {
+        'base_dir': base_dir,
+        'save_dir': save_dir,
+        'test_results_dir': test_results_dir,
+        'dyn_ensemble_dir': dyn_ensemble_dir,
+        'overlay_dir': overlay_dir
+    }
+
+def load_results(save_dir):
+    """Load existing nested CV and test results"""
+    try:
+        # Load nested CV results
+        nested_cv_path = os.path.join(save_dir, "nested_cv_results.json")
+        with open(nested_cv_path, 'r') as f:
+            nested_cv_results = json.load(f)
+        logging.info(f"Loaded nested CV results from {nested_cv_path}")
+        
+        # Load test results
+        test_results_path = os.path.join(save_dir, "test_evaluation", "test_results.json")
+        with open(test_results_path, 'r') as f:
+            test_results = json.load(f)
+        logging.info(f"Loaded test results from {test_results_path}")
+        
+        return nested_cv_results, test_results
+    except Exception as e:
+        logging.error(f"Failed to load results: {e}")
+        raise
+
+def load_fold_models_and_weights(base_dir, fold_nums=range(5)):
+    """
+    Load models and dynamic weights from each fold
+    """
+    model_names = ['resnet101', 'efficientnet_b4', 'densenet121']
+    fold_models = {}
+    fold_dynamic_weights = {}
+    fold_hyperparams = {}
+    
+    for fold_num in fold_nums:
+        fold_dir = os.path.join(base_dir, "saved_models", f"outer_fold_{fold_num}")
+        
+        # Try to load fold-specific hyperparameters
+        try:
+            with open(os.path.join(fold_dir, "fold_config.json"), 'r') as f:
+                fold_config = json.load(f)
+            
+            hyperparams = fold_config.get('hyperparameters', {})
+            fold_hyperparams[fold_num] = hyperparams
+            logging.info(f"Loaded hyperparameters for fold {fold_num}")
+        except Exception as e:
+            logging.warning(f"Could not load hyperparameters for fold {fold_num}: {e}")
+            hyperparams = {}  # Use default hyperparameters
+            fold_hyperparams[fold_num] = {}
+        
+        # Create models based on hyperparameters
+        models_list = []
+        for model_name in model_names:
+            try:
+                model = create_model(
+                    model_name=model_name,
+                    use_attention=hyperparams.get('use_attention', True),
+                    dropout_rate=hyperparams.get('dropout_rate', 0.5),
+                    hidden_size=hyperparams.get('hidden_size', 256),
+                    pretrained=False  # We're loading saved weights
+                )
+                
+                # Load model weights
+                model_path = os.path.join(fold_dir, f"{model_name}_best.pth")
+                loaded_model = load_model(model, model_path)
+                
+                if loaded_model is not None:
+                    loaded_model.to(device)
+                    models_list.append(loaded_model)
+                else:
+                    logging.warning(f"Skipping model {model_name} for fold {fold_num}")
+            except Exception as e:
+                logging.error(f"Error creating/loading model {model_name} for fold {fold_num}: {e}")
+        
+        if models_list:
+            fold_models[fold_num] = models_list
+            
+            # Load dynamic weight
+            try:
+                dynamic_weight = DynamicWeight(len(models_list))
+                dw_path = os.path.join(fold_dir, "dynamic_weight_best.pth")
+                loaded_dw = load_dynamic_weight(dynamic_weight, dw_path)
+                
+                if loaded_dw is not None:
+                    loaded_dw.to(device)
+                    fold_dynamic_weights[fold_num] = loaded_dw
+                else:
+                    logging.warning(f"Using equal weights for fold {fold_num}")
+                    fold_dynamic_weights[fold_num] = dynamic_weight.to(device)
+            except Exception as e:
+                logging.error(f"Error loading dynamic weight for fold {fold_num}: {e}")
+                # Use default equal weighting
+                fold_dynamic_weights[fold_num] = DynamicWeight(len(models_list)).to(device)
+    
+    return fold_models, fold_dynamic_weights, fold_hyperparams
+
+def load_test_data(data_dir):
+    """
+    Load and preprocess test data
+    """
+    # Define test transform (non-augmenting)
+    test_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    # Create test dataset
+    from torchvision import datasets
+    test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, "test"), transform=test_transform)
+    
+    # Create test loader
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True
+    )
+    
+    logging.info(f"Loaded test dataset with {len(test_dataset)} images")
+    return test_loader, test_dataset
+
+def create_dynamic_ensemble_predictions(fold_models, fold_dynamic_weights, test_loader, dyn_ensemble_dir):
+    """
+    Create ensemble predictions using the dynamic weights from each fold
+    """
+    # Collect predictions for each fold
+    fold_probs = {}
+    fold_preds = {}
+    all_labels = None
+    
+    # Make predictions for each fold
+    for fold_num, models in fold_models.items():
+        dynamic_weight = fold_dynamic_weights[fold_num]
+        
+        all_outputs = []
+        fold_labels = []
+        
+        # Run inference
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images, labels = images.to(device), labels.to(device)
+                
+                outputs = []
+                for model in models:
+                    model.eval()
+                    outputs.append(model(images))
+                
+                # Apply dynamic weighting
+                weighted_output = dynamic_weight(outputs)
+                probs = torch.sigmoid(weighted_output).squeeze().cpu().numpy()
+                
+                all_outputs.append(probs)
+                fold_labels.append(labels.cpu().numpy())
+        
+        # Concatenate all batches
+        fold_probs[fold_num] = np.concatenate(all_outputs)
+        all_labels = np.concatenate(fold_labels) if all_labels is None else all_labels
+    
+    # Average probabilities across folds
+    all_fold_probs = np.stack([fold_probs[fold_num] for fold_num in fold_models.keys()])
+    dynamic_ensemble_probs = np.mean(all_fold_probs, axis=0)
+    
+    # Find optimal threshold for ensemble
+    precisions, recalls, thresholds = precision_recall_curve(all_labels, dynamic_ensemble_probs)
+    # Handle the edge case where precision/recall have one more element than thresholds
+    f1_scores = 2 * (precisions[:-1] * recalls[:-1]) / (precisions[:-1] + recalls[:-1] + 1e-8)
+    optimal_idx = np.argmax(f1_scores)
+    optimal_threshold = thresholds[optimal_idx]
+    
+    # Generate predictions using optimal threshold
+    dynamic_ensemble_preds = (dynamic_ensemble_probs >= optimal_threshold).astype(int)
+    
+    # Calculate metrics
+    ensemble_metrics = {
+        'accuracy': accuracy_score(all_labels, dynamic_ensemble_preds),
+        'precision': precision_score(all_labels, dynamic_ensemble_preds),
+        'recall': recall_score(all_labels, dynamic_ensemble_preds),
+        'sensitivity': recall_score(all_labels, dynamic_ensemble_preds),  # Same as recall
+        'f1': f1_score(all_labels, dynamic_ensemble_preds),
+        'mcc': matthews_corrcoef(all_labels, dynamic_ensemble_preds),
+    }
+    
+    # Calculate ROC curve and AUC
+    fpr, tpr, _ = roc_curve(all_labels, dynamic_ensemble_probs)
+    ensemble_metrics['auc'] = auc(fpr, tpr)
+    
+    # Calculate confusion matrix
+    cm = confusion_matrix(all_labels, dynamic_ensemble_preds)
+    tn, fp, fn, tp = cm.ravel()
+    ensemble_metrics['specificity'] = tn / (tn + fp) if (tn + fp) > 0 else 0
+    
+    # Calculate average precision
+    ensemble_metrics['avg_precision'] = np.trapz(precisions, recalls)
+    
+    # Calculate log loss
+    try:
+        ensemble_metrics['log_loss'] = log_loss(all_labels, dynamic_ensemble_probs)
+    except:
+        try:
+            # Older sklearn versions might not accept eps parameter
+            ensemble_metrics['log_loss'] = log_loss(all_labels, np.clip(dynamic_ensemble_probs, 1e-7, 1-1e-7))
+        except Exception as e:
+            logging.warning(f"Could not calculate log loss: {e}")
+            ensemble_metrics['log_loss'] = 0.0
+    
+    # Save ensemble data
+    os.makedirs(dyn_ensemble_dir, exist_ok=True)
+    np.savez(os.path.join(dyn_ensemble_dir, "dynamic_ensemble_probs_labels.npz"),
+             probabilities=dynamic_ensemble_probs, labels=all_labels)
+    
+    # Save fold probabilities
+    for fold_num, probs in fold_probs.items():
+        np.savez(os.path.join(dyn_ensemble_dir, f"fold_{fold_num}_probs.npz"),
+                probabilities=probs, labels=all_labels)
+    
+    # Save ROC curve data
+    roc_data = {
+        'fpr': fpr.tolist(),
+        'tpr': tpr.tolist(),
+        'auc': ensemble_metrics['auc']
+    }
+    with open(os.path.join(dyn_ensemble_dir, "dynamic_ensemble_roc_data.json"), 'w') as f:
+        json.dump(roc_data, f, indent=4)
+    
+    # Save PR curve data
+    pr_data = {
+        'precision': precisions.tolist(),
+        'recall': recalls.tolist(),
+        'thresholds': thresholds.tolist() if len(thresholds) > 0 else [0.5],
+        'avg_precision': ensemble_metrics['avg_precision']
+    }
+    with open(os.path.join(dyn_ensemble_dir, "dynamic_ensemble_pr_data.json"), 'w') as f:
+        json.dump(pr_data, f, indent=4)
+    
+    dynamic_ensemble_results = {
+        'metrics': ensemble_metrics,
+        'optimal_threshold': float(optimal_threshold),
+        'fold_weights': {str(fold_num): torch.nn.functional.softmax(dw.weights, dim=-1).cpu().detach().numpy().tolist() 
+                                for fold_num, dw in fold_dynamic_weights.items()}
+    }
+    
+    return dynamic_ensemble_results, fold_probs, all_labels
+
+def plot_dynamic_ensemble_visualizations(ensemble_results, dyn_ensemble_dir):
+    """Create visualizations for the dynamic ensemble model"""
+    if not ensemble_results:
+        logging.error("Missing data for dynamic ensemble visualizations")
+        return
+    
+    # Get ensemble predictions
+    ensemble_file = os.path.join(dyn_ensemble_dir, "dynamic_ensemble_probs_labels.npz")
+    if not os.path.exists(ensemble_file):
+        logging.error("Dynamic ensemble predictions file not found")
+        return
+    
+    ensemble_data = np.load(ensemble_file)
+    ensemble_probs = ensemble_data['probabilities']
+    labels = ensemble_data['labels']
+    optimal_threshold = ensemble_results['optimal_threshold']
+    ensemble_preds = (ensemble_probs >= optimal_threshold).astype(int)
+    
+    # 1. ROC Curve
+    fpr, tpr, _ = roc_curve(labels, ensemble_probs)
+    roc_auc = ensemble_results['metrics']['auc']
+    
+    plt.figure(figsize=(10, 8))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'Dynamic Ensemble ROC (AUC = {roc_auc:.3f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate', fontsize=14)
+    plt.ylabel('True Positive Rate', fontsize=14)
+    plt.title('Dynamic Weighted Ensemble ROC Curve', fontsize=16)
+    plt.legend(loc="lower right", fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(dyn_ensemble_dir, "dynamic_ensemble_roc_curve.png"), dpi=300)
+    plt.close()
+    
+    # 2. Precision-Recall Curve
+    precisions, recalls, _ = precision_recall_curve(labels, ensemble_probs)
+    avg_precision = ensemble_results['metrics']['avg_precision']
+    
+    plt.figure(figsize=(10, 8))
+    plt.plot(recalls, precisions, 'b-', lw=2, label=f'Dynamic Ensemble PR Curve (AP = {avg_precision:.3f})')
+    plt.xlabel('Recall', fontsize=14)
+    plt.ylabel('Precision', fontsize=14)
+    plt.title('Dynamic Weighted Ensemble Precision-Recall Curve', fontsize=16)
+    plt.legend(loc="best", fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(dyn_ensemble_dir, "dynamic_ensemble_pr_curve.png"), dpi=300)
+    plt.close()
+    
+    # 3. Confusion Matrix
+    cm = confusion_matrix(labels, ensemble_preds)
+    plt.figure(figsize=(8, 6))
+    plt.imshow(cm, cmap='Blues', interpolation='nearest')
+    plt.title(f'Confusion Matrix (Threshold = {optimal_threshold:.2f})', fontsize=14)
+    plt.colorbar()
+    tick_marks = np.arange(len(cm))
+    plt.xticks(tick_marks, ['Class 0', 'Class 1'], rotation=45, fontsize=12)
+    plt.yticks(tick_marks, ['Class 0', 'Class 1'], fontsize=12)
+    
+    # Add numbers to the confusion matrix
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], 'd'),
+                    ha="center", va="center", fontsize=12,
+                    color="white" if cm[i, j] > thresh else "black")
+    
+    plt.ylabel('True label', fontsize=12)
+    plt.xlabel('Predicted label', fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(dyn_ensemble_dir, "dynamic_ensemble_confusion_matrix.png"), dpi=300)
+    plt.close()
+    
+    # 4. Probability Distribution
+    plt.figure(figsize=(12, 6))
+    
+    # Separate probabilities for each class
+    pos_probs = ensemble_probs[labels == 1]
+    neg_probs = ensemble_probs[labels == 0]
+    
+    plt.hist(pos_probs, bins=30, alpha=0.6, label='Positive Class (1)', color='blue', density=True)
+    plt.hist(neg_probs, bins=30, alpha=0.6, label='Negative Class (0)', color='red', density=True)
+    plt.axvline(x=optimal_threshold, color='green', linestyle='--', 
+               label=f'Optimal Threshold: {optimal_threshold:.3f}')
+    
+    plt.xlabel('Predicted Probability', fontsize=14)
+    plt.ylabel('Density', fontsize=14)
+    plt.title(f'Dynamic Weighted Ensemble Probability Distribution', fontsize=16)
+    plt.legend(fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(dyn_ensemble_dir, "dynamic_ensemble_prob_distribution.png"), dpi=300)
+    plt.close()
+    
+    # 5. Visualization of learned weights for each model in each fold
+    fold_weights = ensemble_results.get('fold_weights', {})
+    if fold_weights:
+        plt.figure(figsize=(12, 8))
+        model_names = ['ResNet101', 'EfficientNet-B4', 'DenseNet121']
+        fold_nums = sorted([int(k) for k in fold_weights.keys()])
+        
+        x = np.arange(len(model_names))
+        width = 0.7 / len(fold_nums)
+        
+        for i, fold_num in enumerate(fold_nums):
+            weights = fold_weights[str(fold_num)]
+            if len(weights) == len(model_names):
+                plt.bar(x + i*width - 0.35, weights, width, label=f'Fold {fold_num}')
+        
+        plt.xlabel('Model Architecture', fontsize=14)
+        plt.ylabel('Learned Weight', fontsize=14)
+        plt.title('Dynamic Weights Learned for Each Model in Each Fold', fontsize=16)
+        plt.xticks(x, model_names)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(dyn_ensemble_dir, "model_weights_visualization.png"), dpi=300)
+        plt.close()
+    
+    logging.info("Dynamic ensemble visualizations created successfully")
+    
+def create_ensemble_vs_folds_overlay_plots(fold_probs, all_labels, dynamic_ensemble_results, test_results, base_dir):
+    """
+    Create overlay plots comparing all individual folds with the dynamic ensemble
+    """
+    # Create directory for overlay plots
+    overlay_dir = os.path.join(base_dir, "saved_models", "test_evaluation", "overlay_plots")
+    os.makedirs(overlay_dir, exist_ok=True)
+    
+    # Get dynamic ensemble probabilities
+    dyn_ensemble_dir = os.path.join(base_dir, "saved_models", "test_evaluation", "dynamic_ensemble_plots")
+    ensemble_file = os.path.join(dyn_ensemble_dir, "dynamic_ensemble_probs_labels.npz")
+    
+    if not os.path.exists(ensemble_file):
+        logging.error("Dynamic ensemble predictions file not found for overlay plots")
+        return
+    
+    ensemble_data = np.load(ensemble_file)
+    ensemble_probs = ensemble_data['probabilities']
+    
+    # 1. ROC Curves Overlay
+    plt.figure(figsize=(12, 10))
+    
+    # Colors for different folds
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+    line_styles = ['-', '--', '-.', ':', '-', '--']
+    
+    # Plot ROC curve for each fold
+    for i, (fold_num, probs) in enumerate(sorted(fold_probs.items())):
+        fpr, tpr, _ = roc_curve(all_labels, probs)
+        roc_auc = auc(fpr, tpr)
+        
+        plt.plot(fpr, tpr, color=colors[i % len(colors)], 
+                linestyle=line_styles[i % len(line_styles)],
+                lw=2, label=f'Fold {fold_num} (AUC = {roc_auc:.3f})')
+    
+    # Add dynamic ensemble ROC
+    fpr, tpr, _ = roc_curve(all_labels, ensemble_probs)
+    roc_auc = dynamic_ensemble_results['metrics']['auc']
+    plt.plot(fpr, tpr, color='black', linestyle='-', lw=3,
+            label=f'Dynamic Ensemble (AUC = {roc_auc:.3f})')
+    
+    # Add reference line
+    plt.plot([0, 1], [0, 1], 'k--', lw=1)
+    
+    # Customize plot
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate', fontsize=14)
+    plt.ylabel('True Positive Rate', fontsize=14)
+    plt.title('ROC Curves: Individual Folds vs Dynamic Ensemble', fontsize=16)
+    plt.legend(loc="lower right", fontsize=12)
+    plt.grid(True, alpha=0.3)
+    
+    plt.savefig(os.path.join(overlay_dir, 'roc_curves_folds_vs_ensemble_overlay.png'), dpi=300)
+    plt.savefig(os.path.join(overlay_dir, 'roc_curves_folds_vs_ensemble_overlay.pdf'))
+    plt.close()
+    
+    # 2. Precision-Recall Curves Overlay
+    plt.figure(figsize=(12, 10))
+    
+    # Plot PR curve for each fold
+    for i, (fold_num, probs) in enumerate(sorted(fold_probs.items())):
+        precision, recall, _ = precision_recall_curve(all_labels, probs)
+        pr_auc = np.trapz(precision, recall)
+        
+        plt.plot(recall, precision, color=colors[i % len(colors)], 
+                linestyle=line_styles[i % len(line_styles)],
+                lw=2, label=f'Fold {fold_num} (AP = {pr_auc:.3f})')
+    
+    # Add dynamic ensemble PR curve
+    precision, recall, _ = precision_recall_curve(all_labels, ensemble_probs)
+    pr_auc = dynamic_ensemble_results['metrics']['avg_precision']
+    plt.plot(recall, precision, color='black', linestyle='-', lw=3,
+            label=f'Dynamic Ensemble (AP = {pr_auc:.3f})')
+    
+    # Customize plot
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('Recall', fontsize=14)
+    plt.ylabel('Precision', fontsize=14)
+    plt.title('Precision-Recall Curves: Individual Folds vs Dynamic Ensemble', fontsize=16)
+    plt.legend(loc="best", fontsize=12)
+    plt.grid(True, alpha=0.3)
+    
+    plt.savefig(os.path.join(overlay_dir, 'pr_curves_folds_vs_ensemble_overlay.png'), dpi=300)
+    plt.savefig(os.path.join(overlay_dir, 'pr_curves_folds_vs_ensemble_overlay.pdf'))
+    plt.close()
+    
+    # 3. Create metrics comparison bar chart
+    metrics = ['accuracy', 'precision', 'recall', 'f1', 'auc', 'specificity', 'mcc']
+    fold_results = {k: v for k, v in test_results.items() if k.startswith('fold_')}
+    
+    for metric in metrics:
+        plt.figure(figsize=(14, 8))
+        
+        # Extract values for each fold
+        fold_nums = []
+        fold_values = []
+        
+        for fold_key, fold_data in sorted(fold_results.items()):
+            fold_num = int(fold_key.split('_')[1])
+            fold_nums.append(fold_num)
+            value = fold_data['metrics'].get(metric, 0)
+            fold_values.append(value)
+        
+        # Add ensemble value
+        ensemble_value = dynamic_ensemble_results['metrics'].get(metric, 0)
+        
+        # Create bar positions
+        x = np.arange(len(fold_nums) + 1)  # Folds + ensemble
+        
+        # Plot bars
+        plt.bar(x[:-1], fold_values, color='steelblue', alpha=0.7, label='Individual Folds')
+        plt.bar(x[-1], [ensemble_value], color='darkred', alpha=0.7, label='Dynamic Ensemble')
+        
+        # Add value labels
+        for i, value in enumerate(fold_values + [ensemble_value]):
+            plt.text(i, value + 0.01, f'{value:.3f}', ha='center', va='bottom', fontsize=10)
+        
+        # Add fold average line
+        avg_fold_value = np.mean(fold_values)
+        plt.axhline(y=avg_fold_value, color='navy', linestyle='--', 
+                   label=f'Fold Average: {avg_fold_value:.3f}')
+        
+        # Customize plot
+        plt.xlabel('Model', fontsize=14)
+        plt.ylabel(f'{metric.capitalize()} Score', fontsize=14)
+        plt.title(f'{metric.capitalize()}: Individual Folds vs Dynamic Ensemble', fontsize=16)
+        plt.xticks(x, [f'Fold {num}' for num in fold_nums] + ['Ensemble'])
+        plt.legend(loc='best')
+        plt.grid(axis='y', alpha=0.3)
+        
+        # Set ylim based on metric
+        if metric == 'mcc':
+            plt.ylim(-1.1, 1.1)
+        else:
+            plt.ylim(0, 1.1)
+        
+        plt.savefig(os.path.join(overlay_dir, f'{metric}_folds_vs_ensemble_comparison.png'), dpi=300)
+        plt.savefig(os.path.join(overlay_dir, f'{metric}_folds_vs_ensemble_comparison.pdf'))
+        plt.close()
+    
+    # 4. Radar chart comparing all folds and ensemble
+    metrics = ['accuracy', 'precision', 'recall', 'f1', 'auc', 'specificity']
+    metrics_nice_names = ['Accuracy', 'Precision', 'Recall', 'F1', 'AUC', 'Specificity']
+    
+    # Set up the radar chart
+    n_metrics = len(metrics)
+    angles = np.linspace(0, 2*np.pi, n_metrics, endpoint=False).tolist()
+    angles += angles[:1]  # Close the polygon
+    
+    fig, ax = plt.subplots(figsize=(12, 10), subplot_kw=dict(polar=True))
+    
+    # Plot data for each fold
+    for i, (fold_key, fold_data) in enumerate(sorted(fold_results.items())):
+        fold_num = int(fold_key.split('_')[1])
+        
+        # Get metrics for this fold
+        fold_values = []
+        for m in metrics:
+            if m in fold_data['metrics']:
+                fold_values.append(fold_data['metrics'][m])
+            else:
+                fold_values.append(0)  # Default if metric not found
+                
+        fold_values += fold_values[:1]  # Close the polygon
+        
+        # Plot fold data
+        ax.plot(angles, fold_values, color=colors[i % len(colors)], 
+                linestyle=line_styles[i % len(line_styles)], linewidth=2, 
+                label=f'Fold {fold_num}')
+        ax.fill(angles, fold_values, color=colors[i % len(colors)], alpha=0.1)
+    
+    # Add ensemble data
+    ensemble_values = []
+    for m in metrics:
+        if m in dynamic_ensemble_results['metrics']:
+            ensemble_values.append(dynamic_ensemble_results['metrics'][m])
+        else:
+            ensemble_values.append(0)
+            
+    ensemble_values += ensemble_values[:1]  # Close the polygon
+    
+    ax.plot(angles, ensemble_values, color='darkred', linewidth=3, label='Dynamic Ensemble')
+    ax.fill(angles, ensemble_values, color='darkred', alpha=0.1)
+    
+    # Set up the radar chart properties
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(metrics_nice_names, fontsize=12)
+    
+    # Add y-axis grid lines at 0.2 intervals
+    ax.set_yticks(np.arange(0, 1.1, 0.2))
+    ax.set_ylim(0, 1)
+    
+    # Add a title
+    plt.title('Performance Metrics: Individual Folds vs Dynamic Ensemble', fontsize=16, y=1.08)
+    
+    # Add a legend
+    plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
+    
+    plt.savefig(os.path.join(overlay_dir, 'metrics_radar_folds_vs_ensemble.png'), dpi=300)
+    plt.savefig(os.path.join(overlay_dir, 'metrics_radar_folds_vs_ensemble.pdf'))
+    plt.close()
+    
+    # 5. Create statistical comparison report
+    stats_path = os.path.join(overlay_dir, "folds_vs_ensemble_statistical_comparison.txt")
+    with open(stats_path, 'w') as f:
+        f.write("STATISTICAL COMPARISON: INDIVIDUAL FOLDS VS DYNAMIC ENSEMBLE\n\n")
+        
+        for metric in metrics:
+            f.write(f"===== {metric.upper()} =====\n")
+            
+            # Get fold values
+            fold_values = [fold_data['metrics'].get(metric, 0) for _, fold_data in sorted(fold_results.items())]
+            ensemble_value = dynamic_ensemble_results['metrics'].get(metric, 0)
+            
+            # Calculate statistics
+            fold_avg = np.mean(fold_values)
+            fold_std = np.std(fold_values)
+            fold_min = np.min(fold_values)
+            fold_max = np.max(fold_values)
+            
+            # Statistical improvement over average
+            improvement_over_avg = ensemble_value - fold_avg
+            relative_improvement = (improvement_over_avg / fold_avg) * 100 if fold_avg > 0 else 0
+            
+            # Count how many folds ensemble beats
+            better_than_count = sum(1 for val in fold_values if ensemble_value > val)
+            total_folds = len(fold_values)
+            
+            # Write statistics
+            f.write(f"Fold average: {fold_avg:.4f} ± {fold_std:.4f}\n")
+            f.write(f"Fold range: [{fold_min:.4f}, {fold_max:.4f}]\n")
+            f.write(f"Dynamic Ensemble: {ensemble_value:.4f}\n")
+            f.write(f"Improvement over average: {improvement_over_avg:.4f} ({relative_improvement:.2f}%)\n")
+            f.write(f"Ensemble beats {better_than_count}/{total_folds} individual folds\n\n")
+        
+        # Overall conclusion
+        f.write("OVERALL CONCLUSION:\n")
+        f.write("The dynamic weighted ensemble combines predictions from all folds using learned weights.\n")
+        
+        # Count metrics where ensemble beats the average
+        metrics_better_than_avg = 0
+        for metric in metrics:
+            fold_values = [fold_data['metrics'].get(metric, 0) for _, fold_data in sorted(fold_results.items())]
+            ensemble_value = dynamic_ensemble_results['metrics'].get(metric, 0)
+            fold_avg = np.mean(fold_values)
+            
+            if ensemble_value > fold_avg:
+                metrics_better_than_avg += 1
+        
+        f.write(f"The ensemble outperforms the fold average in {metrics_better_than_avg}/{len(metrics)} metrics.\n")
+    
+    logging.info(f"Created fold vs ensemble overlay plots and statistical comparisons in {overlay_dir}")
+    return
+
+def update_test_results(test_results, dynamic_ensemble_results, save_dir):
+    """Update test results with dynamic ensemble results and save"""
+    if not dynamic_ensemble_results:
+        logging.error("No dynamic ensemble results to update test results")
+        return test_results
+    
+    # Add dynamic ensemble results to test results
+    test_results['dynamic_ensemble'] = dynamic_ensemble_results
+    
+    # Save updated test results
+    test_results_path = os.path.join(save_dir, "test_evaluation", "test_results.json")
+    with open(test_results_path, 'w') as f:
+        json.dump(test_results, f, indent=4)
+    logging.info(f"Updated test results with dynamic ensemble saved to {test_results_path}")
+    
+    return test_results
+
+def create_final_summary(nested_cv_results, test_results, base_dir):
+    """Create a summary of final results including dynamic ensemble"""
+    summary_path = os.path.join(base_dir, "dynamic_ensemble_results_summary.txt")
+    
+    try:
+        with open(summary_path, 'w') as f:
+            f.write(f"{'='*50}\n")
+            f.write(f"SKIN LESION CLASSIFICATION RESULTS SUMMARY\n")
+            f.write(f"WITH DYNAMIC WEIGHTED ENSEMBLE\n")
+            f.write(f"{'='*50}\n\n")
+            
+            f.write("NESTED CROSS-VALIDATION RESULTS:\n")
+            
+            # Get metrics from nested CV results
+            cv_avg_metrics = nested_cv_results.get('average_performance', {}).get('avg_metrics', {})
+            cv_std_metrics = nested_cv_results.get('average_performance', {}).get('std_metrics', {})
+            
+            # If the old format is used
+            if 'avg_f1' in nested_cv_results.get('average_performance', {}):
+                cv_avg_results = nested_cv_results['average_performance']
+                metrics = ['f1', 'auc', 'accuracy', 'sensitivity', 'specificity']
+                for metric in metrics:
+                    avg_key = f'avg_{metric}'
+                    std_key = f'std_{metric}'
+                    if avg_key in cv_avg_results and std_key in cv_avg_results:
+                        f.write(f"Average {metric.capitalize()}: {cv_avg_results[avg_key]:.4f} ± {cv_avg_results[std_key]:.4f}\n")
+            else:
+                # New format with nested avg_metrics
+                metrics = ['f1', 'auc', 'accuracy', 'sensitivity', 'specificity']
+                for metric in metrics:
+                    if metric in cv_avg_metrics and metric in cv_std_metrics:
+                        f.write(f"Average {metric.capitalize()}: {cv_avg_metrics[metric]:.4f} ± {cv_std_metrics[metric]:.4f}\n")
+            
+            f.write("\nEXTERNAL TEST SET RESULTS (AVERAGE ACROSS FOLDS):\n")
+            test_avg_metrics = test_results.get('average_performance', {}).get('avg_metrics', {})
+            test_std_metrics = test_results.get('average_performance', {}).get('std_metrics', {})
+            
+            metrics = ['f1', 'auc', 'accuracy', 'sensitivity', 'specificity', 'precision', 'mcc']
+            for metric in metrics:
+                if metric in test_avg_metrics and metric in test_std_metrics:
+                    f.write(f"Average {metric.capitalize()}: {test_avg_metrics[metric]:.4f} ± {test_std_metrics[metric]:.4f}\n")
+            
+            # Add results for regular ensemble if available
+            if 'ensemble' in test_results:
+                f.write("\nREGULAR ENSEMBLE MODEL TEST RESULTS:\n")
+                f.write(f"Optimal Threshold: {test_results['ensemble']['optimal_threshold']:.4f}\n")
+                
+                ensemble_metrics = test_results['ensemble']['metrics']
+                for metric in metrics:
+                    if metric in ensemble_metrics:
+                        f.write(f"{metric.capitalize()}: {ensemble_metrics[metric]:.4f}\n")
+            
+            # Add results for dynamic weighted ensemble
+            if 'dynamic_ensemble' in test_results:
+                f.write("\nDYNAMIC WEIGHTED ENSEMBLE TEST RESULTS:\n")
+                f.write(f"Optimal Threshold: {test_results['dynamic_ensemble']['optimal_threshold']:.4f}\n")
+                
+                dynamic_ensemble_metrics = test_results['dynamic_ensemble']['metrics']
+                for metric in metrics:
+                    if metric in dynamic_ensemble_metrics:
+                        f.write(f"{metric.capitalize()}: {dynamic_ensemble_metrics[metric]:.4f}\n")
+                
+                # Add weights information if available
+                fold_weights = test_results['dynamic_ensemble'].get('fold_weights', {})
+                if fold_weights:
+                    f.write("\nLearned Model Weights by Fold:\n")
+                    model_names = ['ResNet101', 'EfficientNet-B4', 'DenseNet121']
+                    
+                    for fold_num, weights in fold_weights.items():
+                        f.write(f"  Fold {fold_num}:\n")
+                        for i, model_name in enumerate(model_names):
+                            if i < len(weights):
+                                f.write(f"    {model_name}: {weights[i]:.4f}\n")
+            
+            f.write(f"\n{'='*50}\n")
+            f.write(f"Generated on: {logging.Formatter().formatTime(logging.LogRecord('', 0, '', 0, None, None, None))}\n")
+            f.write(f"{'='*50}\n")
+        
+        logging.info(f"Summary saved to {summary_path}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to create summary: {e}")
+        return False
+
+def compare_ensemble_methods(test_results, base_dir):
+    """Compare regular ensemble and dynamic weighted ensemble"""
+    if 'ensemble' not in test_results or 'dynamic_ensemble' not in test_results:
+        logging.warning("Cannot compare ensemble methods - one or both methods missing")
+        return
+    
+    comparison_dir = os.path.join(base_dir, "saved_models", "test_evaluation", "ensemble_comparison")
+    os.makedirs(comparison_dir, exist_ok=True)
+    
+    # Extract metrics for comparison
+    metrics = ['accuracy', 'precision', 'recall', 'f1', 'auc', 'specificity', 'mcc']
+    regular_metrics = test_results['ensemble']['metrics']
+    dynamic_metrics = test_results['dynamic_ensemble']['metrics']
+    
+    # Create comparison bar chart
+    plt.figure(figsize=(14, 8))
+    
+    x = np.arange(len(metrics))
+    width = 0.35
+    
+    # Prepare data for both ensemble methods
+    regular_values = [regular_metrics.get(m, 0) for m in metrics]
+    dynamic_values = [dynamic_metrics.get(m, 0) for m in metrics]
+    
+    # Plot bars
+    plt.bar(x - width/2, regular_values, width, label='Regular Ensemble', color='blue', alpha=0.7)
+    plt.bar(x + width/2, dynamic_values, width, label='Dynamic Weighted Ensemble', color='green', alpha=0.7)
+    
+    # Add value labels
+    for i, v in enumerate(regular_values):
+        plt.text(i - width/2, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+    
+    for i, v in enumerate(dynamic_values):
+        plt.text(i + width/2, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+    
+    # Customize chart
+    plt.xlabel('Metrics', fontsize=14)
+    plt.ylabel('Value', fontsize=14)
+    plt.title('Comparison of Ensemble Methods', fontsize=16)
+    plt.xticks(x, [m.capitalize() for m in metrics])
+    plt.legend()
+    plt.grid(axis='y', alpha=0.3)
+    plt.ylim(0, 1.1)
+    
+    # Save the chart
+    plt.savefig(os.path.join(comparison_dir, "ensemble_methods_comparison.png"), dpi=300)
+    plt.savefig(os.path.join(comparison_dir, "ensemble_methods_comparison.pdf"))
+    plt.close()
+    
+    # Compare thresholds
+    reg_threshold = test_results['ensemble']['optimal_threshold']
+    dyn_threshold = test_results['dynamic_ensemble']['optimal_threshold']
+    
+    # Create a small summary file
+    summary_path = os.path.join(comparison_dir, "ensemble_comparison_summary.txt")
+    with open(summary_path, 'w') as f:
+        f.write("ENSEMBLE METHODS COMPARISON\n\n")
+        
+        f.write(f"Optimal Threshold:\n")
+        f.write(f"  Regular Ensemble: {reg_threshold:.4f}\n")
+        f.write(f"  Dynamic Weighted Ensemble: {dyn_threshold:.4f}\n\n")
+        
+        f.write("Performance Metrics:\n")
+        for metric in metrics:
+            reg_val = regular_metrics.get(metric, 0)
+            dyn_val = dynamic_metrics.get(metric, 0)
+            diff = dyn_val - reg_val
+            winner = "Dynamic" if diff > 0 else "Regular" if diff < 0 else "Tie"
+            
+            f.write(f"  {metric.capitalize()}:\n")
+            f.write(f"    Regular Ensemble: {reg_val:.4f}\n")
+            f.write(f"    Dynamic Weighted Ensemble: {dyn_val:.4f}\n")
+            f.write(f"    Difference: {diff:.4f} ({winner})\n\n")
+    
+    logging.info(f"Ensemble methods comparison saved to {comparison_dir}")
+    return
+
+def main():
+    """Main function to run the dynamic weighted ensemble finalization process"""
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='Finalize skin lesion classification results with dynamic weighted ensemble.')
+    parser.add_argument('--base_dir', type=str, default="/scratch365/mli29/combined_bayesian",
+                        help='Base directory for the experiment')
+    parser.add_argument('--data_dir', type=str, default="/scratch365/mli29/combo_data",
+                        help='Directory containing the dataset')
+    args = parser.parse_args()
+    
+    try:
+        # Set up directories
+        dirs = setup_directories(args.base_dir)
+        
+        # Load existing results
+        nested_cv_results, test_results = load_results(dirs['save_dir'])
+        
+        # Load fold models and dynamic weights
+        logging.info("Loading fold models and dynamic weights...")
+        fold_models, fold_dynamic_weights, fold_hyperparams = load_fold_models_and_weights(args.base_dir)
+        
+        if not fold_models:
+            logging.error("Failed to load any fold models. Cannot create dynamic weighted ensemble.")
+            return False
+        
+        # Load test data
+        logging.info("Loading test data...")
+        test_loader, test_dataset = load_test_data(args.data_dir)
+        
+        # Create dynamic ensemble predictions
+        logging.info("Creating dynamic weighted ensemble predictions...")
+        dynamic_ensemble_results, fold_probs, all_labels = create_dynamic_ensemble_predictions(
+            fold_models, fold_dynamic_weights, test_loader, dirs['dyn_ensemble_dir']
+        )
+        
+        # Create visualizations
+        logging.info("Creating dynamic weighted ensemble visualizations...")
+        plot_dynamic_ensemble_visualizations(dynamic_ensemble_results, dirs['dyn_ensemble_dir'])
+        
+        # Update test results
+        test_results = update_test_results(test_results, dynamic_ensemble_results, dirs['save_dir'])
+        
+        # Compare ensemble methods
+        if 'ensemble' in test_results:
+            logging.info("Comparing ensemble methods...")
+            compare_ensemble_methods(test_results, args.base_dir)
+        
+        # Create final summary
+        logging.info("Creating final summary...")
+        create_final_summary(nested_cv_results, test_results, args.base_dir)
+        
+        logging.info("Dynamic weighted ensemble finalization completed successfully!")
+        return True
+    
+    except Exception as e:
+        logging.error(f"Error in dynamic weighted ensemble finalization process: {e}", exc_info=True)
+        return False
+
+if __name__ == "__main__":
+    success = main()
+    if success:
+        logging.info("Dynamic weighted ensemble finalization completed successfully!")
+    else:
+        logging.error("Dynamic weighted ensemble finalization failed!")
