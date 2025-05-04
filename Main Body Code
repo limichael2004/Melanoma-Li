@@ -1,4 +1,6 @@
-# FILE: codetrytwentyfour.py
+# Please note that there unresolved bugs in this code, which are addressed in the "Graph Visualization Code" and "Test Set Code"
+
+FILE: codetrytwentyfour.py
 import ssl
 import shutil
 import sys
