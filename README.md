@@ -1,42 +1,109 @@
 
-# Artifical Intelligence Based Detection of Skin Cancer by Michael Li
+# Deep Learning Pipeline for Skin Lesion Classification
 
-Hi, my name is Michael and I am a current junior at the University of Notre Dame majoring in Neuroscience.
+This Python code implements a  deep learning pipeline for skin lesion classification using nested cross-validation and ensemble methods. Here's a detailed breakdown of what the code does:
 
-I taught myself to code in May of 2024 and I recently build an Artifical Intelligence (Deep Learning) framework to detect benign or malignant skin lesions.
+# Select Metrics: 
 
-The novelty of this framework is an dynamic weighted ensemble model (Resnet101, EfficientNet-B7, and DenseNet121) with Bayesian Optimization over 50 trials for >15 hyperparameters. Additionally, there is a custom threshold implementation for binary classification, along with nested cross validation with 5 outer folds and inner folds.
+<img width="340" alt="Screenshot 2025-05-03 at 9 49 46 PM" src="https://github.com/user-attachments/assets/30457dfe-dd86-4728-874f-44126e00fdeb" />
 
-The model was trained and nested cross-validated on the HAM10000 dataset, before undergoing a seperate external test set by Memorial Sloan Kettering.
+# Images
 
-*Please note that there is a minor bug in the main code (combo.py), which is addressed in the testcombo.py and ensemble_folds_overlaid_graphs.py
+<img width="1275" alt="Screenshot 2025-05-03 at 9 53 13 PM" src="https://github.com/user-attachments/assets/0910963c-cf56-4faf-8507-f0efb75aacc5" />
 
-
-## Results
-Here are some select metrics:
-
-NESTED CROSS-VALIDATION RESULTS:
-
-EXTERNAL TEST SET RESULTS (AVERAGE ACROSS 5 FOLDS):
-
-Average Auc: 0.9208 ± 0.0079
-
-Average Accuracy: 0.8824 ± 0.0056
-
-Average Specificity: 0.9260 ± 0.0075
+<img width="1278" alt="Screenshot 2025-05-03 at 9 54 11 PM" src="https://github.com/user-attachments/assets/5328081f-d3f4-4bb3-84bf-a86eaa876f83" />
 
 
-DYNAMIC WEIGHTED ENSEMBLE TEST RESULTS:
+# Overall Purpose
+The code creates a sophisticated machine learning system to classify skin lesions in medical images (likely distinguishing between malignant and benign lesions) with high accuracy and reliability. It uses advanced techniques including:
 
-Optimal Threshold: 0.3386
+Nested k-fold cross-validation for robust performance estimation
 
-Auc: 0.9462
+Bayesian hyperparameter optimization with Optuna
 
-Accuracy: 0.8962
+Ensemble learning combining multiple neural network architectures
 
-Sensitivity: 0.8208
+Dynamic weighting of model predictions
 
-Specificity: 0.9154
+Augmentation techniques including custom image mixing within classes
+
+Comprehensive evaluation metrics and visualization
+
+# Key Components
+1. Data Handling and Augmentation
+
+Uses a custom ClassAwareDataset that extends PyTorch's ImageFolder
+
+Implements a novel ImageMixTransform that intelligently combines images from the same class using various strategies (vertical, horizontal, diagonal splits, etc.)
+
+Applies standard augmentation techniques (rotation, flips, color jittering)
+
+2. Model Architecture
+
+Creates an ensemble of three pre-trained CNN architectures: ResNet101, EfficientNet-B4, and DenseNet121
+Customizes each model with:
+
+Optional attention modules to enhance feature importance
+
+Configurable dropout for regularization
+
+Adjustable hidden layers
+
+Freezing options for transfer learning
+
+
+
+3. Ensemble Learning
+
+Uses a DynamicWeight module to learn optimal weights for each model's predictions
+
+Combines predictions intelligently rather than simple averaging
+
+4. Nested Cross-Validation
+
+Implements nested k-fold cross-validation (10 outer folds, 9 inner folds)
+
+Inner folds optimize hyperparameters with Optuna
+
+Outer folds evaluate generalization performance
+
+
+5. Hyperparameter Optimization
+
+Employs Bayesian optimization (via Optuna) to find optimal hyperparameters
+
+Optimizes data augmentation, model architecture, and training parameters
+
+Uses TPE sampler and median pruner for efficient optimization
+
+6. Comprehensive Metrics and Visualization
+
+Calculates and visualizes numerous performance metrics:
+
+Accuracy, precision, recall, F1 score, AUC-ROC, MCC
+
+Confusion matrices and ROC curves
+
+Probability distributions
+
+Threshold analysis
+
+Creates overlay plots for direct comparison of models and folds
+
+7. Final Evaluation
+
+Evaluates best models from each fold on an external test set
+
+Creates and evaluates an ensemble of all fold models
+
+Generates comprehensive reports and visualizations
+
+
+
+# Output and Results
+
+This is a highly sophisticated, research-grade machine learning pipeline for medical image classification that incorporates state-of-the-art techniques for robust performance evaluation and optimization.
+
 
 
 ## Acknowledgements
