@@ -1,7 +1,7 @@
 
-# Deep Learning Pipeline for Skin Lesion Classification
+# Deep Learning Framework for Skin Lesion Classification
 
-This Python code implements a  deep learning pipeline for skin lesion classification using nested cross-validation and ensemble methods. Here's a detailed breakdown of what the code does:
+This Python code implements a  deep learning framework for skin lesion classification using nested cross-validation and ensemble methods. Here's a detailed breakdown of what the code does:
 
 # Select Metrics: 
 
